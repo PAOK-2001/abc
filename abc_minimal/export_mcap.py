@@ -6,6 +6,7 @@ episode. CLI entrypoint: scripts/export_mcap.py.
 
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -75,7 +76,7 @@ def floor_indices(source_ts, target_ts):
 
 def probe(path, *entries):
     out = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0", *entries, "-of", "csv=p=0", path],
+        ["ffprobe", "-v", "error", "-threads", "2", "-select_streams", "v:0", *entries, "-of", "csv=p=0", path],
         capture_output=True, text=True,
     ).stdout.strip()
     return [int(x) for x in out.split(",")]
@@ -87,12 +88,12 @@ def encode_aligned(h264_path, width, height, needed, out_path):
     vf = (f"scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=decrease:flags=bicubic,"
           f"pad={OUT_W}:{OUT_H}:(ow-iw)/2:(oh-ih)/2,pad=width=ceil(iw/2)*2:height=ceil(ih/2)*2")
     dec = subprocess.Popen(
-        ["ffmpeg", "-i", h264_path, "-f", "rawvideo", "-pix_fmt", "rgb24", "-v", "error", "pipe:1"],
+        ["ffmpeg", "-threads", "2", "-i", h264_path, "-f", "rawvideo", "-pix_fmt", "rgb24", "-v", "error", "pipe:1"],
         stdout=subprocess.PIPE,
     )
     enc = subprocess.Popen(
         ["ffmpeg", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}",
-         "-r", str(FPS), "-i", "-", "-vsync", "0", "-vf", vf, *X264, "-threads", "1", out_path],
+         "-r", str(FPS), "-i", "-", "-vsync", "0", "-filter_threads", "1", "-vf", vf, *X264, "-threads", "1", out_path],
         stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
     src_idx, frame = -1, None
@@ -115,6 +116,8 @@ def encode_aligned(h264_path, width, height, needed, out_path):
 
 def export_episode(job):
     mcap_path, task_name, out_root = job
+    if (Path(out_root) / Path(mcap_path).parent.name / "episode_metadata.json").exists():
+        return Path(mcap_path).parent.name
     from mcap.reader import make_reader
     from mcap_protobuf.decoder import DecoderFactory
 
@@ -225,8 +228,8 @@ def export_episode(job):
             + f"[v0]settb=expr=1/{TIMESCALE},setpts=N*{TICKS_PER_FRAME}[out]"
         )
         subprocess.run(
-            ["ffmpeg", "-y", *sum((["-i", p] for p in mp4s), []),
-             "-filter_complex", filt, "-map", "[out]",
+            ["ffmpeg", "-y", *sum((["-threads", "2", "-i", p] for p in mp4s), []),
+             "-filter_complex_threads", "1", "-filter_complex", filt, "-map", "[out]",
              *X264_STRICT_FFMPEG_ARGS, combined],
             capture_output=True, check=True,
         )
@@ -245,7 +248,6 @@ def export_episode(job):
     # operator prompting); persist it in the metadata when the MCAP carried one.
     if operator_id:
         meta["operator_id"] = operator_id
-    (out_dir / "episode_metadata.json").write_text(json.dumps(meta, indent=2))
 
     # Sidecars for policy conditioning (both optional; absent => task-prompt only):
     #   subtasks.json  {"<frame_idx>": "<label>"}  — the per-frame subtask label,
@@ -260,6 +262,7 @@ def export_episode(job):
         (out_dir / "subtasks.json").write_text(json.dumps(frame_labels))
     if operator_id:
         (out_dir / "operator.json").write_text(json.dumps({"operator_id": operator_id}))
+    (out_dir / "episode_metadata.json").write_text(json.dumps(meta, indent=2))
 
     extra = []
     if operator_id:
@@ -293,6 +296,17 @@ def _frames_to_subtasks(annotations, ticks):
     return out
 
 
+def export_episode_or_fail(job):
+    try:
+        return export_episode(job)
+    except Exception as e:
+        partial = Path(job[2]) / Path(job[0]).parent.name
+        if partial.exists():
+            shutil.rmtree(partial)
+        print(f"[FAIL] {Path(job[0]).parent.name}: {type(e).__name__}: {e}")
+        return False
+
+
 def main(config: ExportMcapConfig):
     jobs = sorted(
         (str(p), p.parent.parent.name, str(config.out_dir))
@@ -300,8 +314,10 @@ def main(config: ExportMcapConfig):
     )
     print(f"{len(jobs)} episodes")
     with Pool(config.workers) as pool:
-        done = [r for r in pool.map(export_episode, jobs) if r]
-    print(f"exported {len(done)}/{len(jobs)}")
+        results = list(pool.imap_unordered(export_episode_or_fail, jobs))
+    done = [r for r in results if r]
+    failed = sum(r is False for r in results)
+    print(f"exported {len(done)}/{len(jobs)}, skipped {len(jobs) - len(done) - failed}, failed {failed}")
 
 
 if __name__ == "__main__":
